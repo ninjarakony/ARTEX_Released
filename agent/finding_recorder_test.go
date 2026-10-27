@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -16,6 +17,15 @@ type failingFindingRecorder struct{}
 
 func (failingFindingRecorder) Record(context.Context, db.RecordFindingInput, []db.TrafficRef) (*db.RecordedFinding, error) {
 	return nil, errors.New("fixture persistence failed")
+}
+
+type capturingFindingRecorder struct {
+	refs []db.TrafficRef
+}
+
+func (r *capturingFindingRecorder) Record(_ context.Context, _ db.RecordFindingInput, refs []db.TrafficRef) (*db.RecordedFinding, error) {
+	r.refs = append([]db.TrafficRef(nil), refs...)
+	return &db.RecordedFinding{Traffic: &db.FindingTraffic{}}, nil
 }
 
 func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
@@ -47,6 +57,84 @@ func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 	}
 	if notices != 3 {
 		t.Fatalf("successful reports notified %d times", notices)
+	}
+}
+
+func TestReportFindingPersistsStructuredReproduction(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("structured reproduction", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	ts := NewToolSet(d.Exploration(task.ExplorationID), "fixture")
+	ts.taskID = task.ID
+	ts.SetFindingRecorder(evidence.New(d, nil, t.TempDir()))
+	reproduction := `{"entry_point":"POST /upload.php","prerequisites":["anonymous access"],"steps":[{"request":"POST /upload.php HTTP/1.1","response":"HTTP/1.1 201 Created","expected":"201 Created","proves":"upload accepted","traffic_ids":[]}]}`
+	result, err := ts.addFinding().Call(t.Context(), json.RawMessage(`{"vulnclass":"upload","severity":"high","summary":"structured fixture","evidence":"proof","reproduction":`+reproduction+`}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded db.RecordedFinding
+	if err := json.Unmarshal([]byte(strings.SplitN(result.Flatten(), "\n", 2)[1]), &recorded); err != nil {
+		t.Fatal(err)
+	}
+	finding, err := d.GetFinding(recorded.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantReproduction, gotReproduction map[string]any
+	if err := json.Unmarshal([]byte(reproduction), &wantReproduction); err != nil {
+		t.Fatal(err)
+	}
+	if finding == nil {
+		t.Fatalf("reproduction was not persisted: %#v", finding)
+	}
+	if err := json.Unmarshal(finding.Reproduction, &gotReproduction); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotReproduction, wantReproduction) {
+		t.Fatalf("reproduction was not persisted: %#v", finding)
+	}
+}
+
+func TestReportFindingStepTrafficPreservesExplicitReferenceMetadata(t *testing.T) {
+	old := FindingTrafficBindingEnabled
+	FindingTrafficBindingEnabled = func() bool { return true }
+	t.Cleanup(func() { FindingTrafficBindingEnabled = old })
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("step traffic merge", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	recorder := &capturingFindingRecorder{}
+	ts := NewToolSet(d.Exploration(task.ExplorationID), "fixture")
+	ts.taskID = task.ID
+	ts.SetFindingRecorder(recorder)
+	reproduction := `{"steps":[{"traffic_ids":["shared"]},{"traffic_ids":["new-step"]}]}`
+	input := `{"vulnclass":"TEST","severity":"low","summary":"step merge","traffic_refs":[{"traffic_id":"shared","role":"proof","note":"preserve this note"},{"traffic_id":"overview","role":"baseline","note":"overview note"}],"reproduction":` + reproduction + `}`
+	result, err := ts.addFinding().Call(t.Context(), json.RawMessage(input), nil)
+	if err != nil || result.IsError {
+		t.Fatalf("report failed: %v %s", err, result.Flatten())
+	}
+	if len(recorder.refs) != 3 {
+		t.Fatalf("unexpected refs: %#v", recorder.refs)
+	}
+	byID := make(map[string]db.TrafficRef, len(recorder.refs))
+	for _, ref := range recorder.refs {
+		byID[ref.TrafficID] = ref
+	}
+	if got := byID["shared"]; got.Role != "proof" || got.Note != "preserve this note" || got.StepIndex != 1 {
+		t.Fatalf("overlapping ref metadata changed: %#v", got)
+	}
+	if got := byID["overview"]; got.Role != "baseline" || got.Note != "overview note" || got.StepIndex != 0 {
+		t.Fatalf("overview ref changed: %#v", got)
+	}
+	if got := byID["new-step"]; got.Role != "supporting" || got.Note != "" || got.StepIndex != 2 {
+		t.Fatalf("new step ref not defaulted: %#v", got)
 	}
 }
 
