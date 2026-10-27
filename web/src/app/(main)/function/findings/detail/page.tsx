@@ -9,6 +9,7 @@ import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
+import { FindingAgentChatDrawer } from "@/components/finding-agent-chat-drawer";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
 import { FindingReproductionSection, hasStructuredReproduction } from "@/components/finding-reproduction-section";
@@ -168,6 +169,7 @@ function FindingDetailInner() {
           {finding.inherited && finding.source_task_id && (
             <Badge variant="outline">来源任务 #{finding.source_task_id} · 只读</Badge>
           )}
+          <FindingAgentChatDrawer finding={finding} />
         </div>
         <TabsList>
           <TabsTrigger value="overview">概览</TabsTrigger>
